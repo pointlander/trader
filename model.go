@@ -9,25 +9,31 @@ import (
 	"math/rand/v2"
 )
 
-// Config is one pre-norm causal transformer layer.
-// A window of Context bytes is scored as next-byte cross-entropy.
+// Config is a stack of pre-norm causal transformer layers.
 // Position i reads bytes 0..i and is trained to predict byte i+1.
-// The last byte is a target only. Attention is causal, so a byte never
-// sees a later byte.
+// Positions come from rotary embeddings applied to queries and keys.
+// The byte embedding is tied to the output projection.
+// A loss span scores only targets whose index lies in [tgtLo, tgtHi).
+// Bytes at index tgtHi and beyond are not inputs, so a held-out tail
+// stays out of the training sequence.
 type Config struct {
 	Vocab   int
 	Context int
 	D       int
 	Heads   int
 	DFF     int
+	Layers  int
 }
 
 func simConfig(context int) Config {
-	return Config{Vocab: 256, Context: context, D: 16, Heads: 2, DFF: 32}
+	return Config{Vocab: 256, Context: context, D: 32, Heads: 4, DFF: 128, Layers: 2}
 }
 
 func (c Config) validate() error {
-	if c.Vocab < 2 || c.Context < 2 || c.D < 1 || c.Heads < 1 || c.DFF < 1 || c.D%c.Heads != 0 {
+	if c.Vocab < 2 || c.Context < 2 || c.D < 1 || c.Heads < 1 || c.DFF < 1 || c.Layers < 1 || c.D%c.Heads != 0 {
+		return errConfig
+	}
+	if (c.D/c.Heads)%2 != 0 {
 		return errConfig
 	}
 	return nil
@@ -35,32 +41,37 @@ func (c Config) validate() error {
 
 func (c Config) dh() int { return c.D / c.Heads }
 
-func (c Config) preds() int { return c.Context - 1 }
-
-// tensors is one node's parameters.
+// tensors is one node's parameters. The output projection is Emb.
 type tensors struct {
-	Emb, Pos       []float32
+	Emb        []float32
+	Bh         []float32
+	LnFW, LnFB []float32
+	Layers     []layer
+}
+
+type layer struct {
 	Ln1W, Ln1B     []float32
 	Wq, Wk, Wv, Wo []float32
 	Bq, Bk, Bv, Bo []float32
 	Ln2W, Ln2B     []float32
 	W1, B1         []float32
 	W2, B2         []float32
-	LnFW, LnFB     []float32
-	Wh, Bh         []float32
 }
 
 func (t *tensors) list() [][]float32 {
-	return [][]float32{
-		t.Emb, t.Pos,
-		t.Ln1W, t.Ln1B,
-		t.Wq, t.Wk, t.Wv, t.Wo,
-		t.Bq, t.Bk, t.Bv, t.Bo,
-		t.Ln2W, t.Ln2B,
-		t.W1, t.B1, t.W2, t.B2,
-		t.LnFW, t.LnFB,
-		t.Wh, t.Bh,
+	out := make([][]float32, 0, 4+len(t.Layers)*16)
+	out = append(out, t.Emb, t.Bh, t.LnFW, t.LnFB)
+	for i := range t.Layers {
+		L := &t.Layers[i]
+		out = append(out,
+			L.Ln1W, L.Ln1B,
+			L.Wq, L.Wk, L.Wv, L.Wo,
+			L.Bq, L.Bk, L.Bv, L.Bo,
+			L.Ln2W, L.Ln2B,
+			L.W1, L.B1, L.W2, L.B2,
+		)
 	}
+	return out
 }
 
 func (t *tensors) zero() {
@@ -74,18 +85,23 @@ func newTensors(cfg Config) *tensors {
 		panic(err)
 	}
 	a := func(n int) []float32 { return make([]float32, n) }
-	d, v, t, dff := cfg.D, cfg.Vocab, cfg.Context, cfg.DFF
-	return &tensors{
-		Emb: a(v * d), Pos: a(t * d),
-		Ln1W: a(d), Ln1B: a(d),
-		Wq: a(d * d), Wk: a(d * d), Wv: a(d * d), Wo: a(d * d),
-		Bq: a(d), Bk: a(d), Bv: a(d), Bo: a(d),
-		Ln2W: a(d), Ln2B: a(d),
-		W1: a(d * dff), B1: a(dff),
-		W2: a(dff * d), B2: a(d),
+	d, v, dff := cfg.D, cfg.Vocab, cfg.DFF
+	t := &tensors{
+		Emb: a(v * d), Bh: a(v),
 		LnFW: a(d), LnFB: a(d),
-		Wh: a(d * v), Bh: a(v),
+		Layers: make([]layer, cfg.Layers),
 	}
+	for i := range t.Layers {
+		t.Layers[i] = layer{
+			Ln1W: a(d), Ln1B: a(d),
+			Wq: a(d * d), Wk: a(d * d), Wv: a(d * d), Wo: a(d * d),
+			Bq: a(d), Bk: a(d), Bv: a(d), Bo: a(d),
+			Ln2W: a(d), Ln2B: a(d),
+			W1: a(d * dff), B1: a(dff),
+			W2: a(dff * d), B2: a(d),
+		}
+	}
+	return t
 }
 
 func paramCount(w *tensors) int {
@@ -105,46 +121,53 @@ func initNormal(r *rand.Rand, w []float32, std float64) {
 func initTensors(w *tensors, r *rand.Rand) {
 	const std = 0.02
 	initNormal(r, w.Emb, std)
-	initNormal(r, w.Pos, std)
-	initNormal(r, w.Wq, std)
-	initNormal(r, w.Wk, std)
-	initNormal(r, w.Wv, std)
-	initNormal(r, w.Wo, std)
-	initNormal(r, w.W1, std)
-	initNormal(r, w.W2, std)
-	initNormal(r, w.Wh, std)
-	for i := range w.Ln1W {
-		w.Ln1W[i] = 1
-		w.Ln2W[i] = 1
+	for i := range w.Layers {
+		L := &w.Layers[i]
+		initNormal(r, L.Wq, std)
+		initNormal(r, L.Wk, std)
+		initNormal(r, L.Wv, std)
+		initNormal(r, L.Wo, std)
+		initNormal(r, L.W1, std)
+		initNormal(r, L.W2, std)
+		for j := range L.Ln1W {
+			L.Ln1W[j] = 1
+			L.Ln2W[j] = 1
+		}
+	}
+	for i := range w.LnFW {
 		w.LnFW[i] = 1
 	}
 }
 
+type layerAct struct {
+	h, ln1           []float32
+	ln1Mean, ln1Rstd []float32
+	q, k, v          []float32
+	attn             []float32
+	ctx, ao, h2      []float32
+	ln2              []float32
+	ln2Mean, ln2Rstd []float32
+	pre, hid, fo, h3 []float32
+}
+
 type workspace struct {
+	maxT                int
 	T, D, H, Dh, DFF, V int
-	h, ln1              []float32
-	ln1Mean, ln1Rstd    []float32
-	q, k, v             []float32
-	scores, attn        []float32
-	ctx, ao, h2         []float32
-	ln2                 []float32
-	ln2Mean, ln2Rstd    []float32
-	pre, hid, fo, h3    []float32
+	blocks              []layerAct
 	lnf                 []float32
 	lnfMean, lnfRstd    []float32
 	logits, glogits     []float32
+	tok                 []float32
+	ropeCos, ropeSin    []float32
 
-	qh, kh, vh, ctxh []float32
-	gctxh, dqh       []float32
-	kt, vt, gkt, gvt []float32
-	ds               []float32
-
-	gh, gln1         []float32
-	gq, gk, gv, gctx []float32
-	gh2              []float32
-	gln2, gpre, ghid []float32
-	gh3, glnf        []float32
-	dx               []float32
+	scores, ds          []float32
+	qh, kh, vh, ctxh    []float32
+	gctxh, dqh          []float32
+	kt, vt, gkt, gvt    []float32
+	gq, gk, gv, gctx    []float32
+	gh, gln1, gh2, gln2 []float32
+	gpre, ghid, gh3, dx []float32
+	glnf, upstream      []float32
 }
 
 func newWorkspace(cfg Config) *workspace {
@@ -155,26 +178,65 @@ func newWorkspace(cfg Config) *workspace {
 	dh := d / h
 	f := func(n int) []float32 { return make([]float32, n) }
 	td := T * d
-	return &workspace{
-		T: T, D: d, H: h, Dh: dh, DFF: dff, V: v,
-		h: f(td), ln1: f(td), ln1Mean: f(T), ln1Rstd: f(T),
-		q: f(td), k: f(td), v: f(td),
-		scores: f(T * T), attn: f(h * T * T),
-		ctx: f(td), ao: f(td), h2: f(td),
-		ln2: f(td), ln2Mean: f(T), ln2Rstd: f(T),
-		pre: f(T * dff), hid: f(T * dff), fo: f(td), h3: f(td),
-		lnf: f(td), lnfMean: f(T), lnfRstd: f(T),
+	ws := &workspace{
+		maxT: T, T: T, D: d, H: h, Dh: dh, DFF: dff, V: v,
+		blocks: make([]layerAct, cfg.Layers),
+		lnf:    f(td), lnfMean: f(T), lnfRstd: f(T),
 		logits: f(T * v), glogits: f(T * v),
+		tok:     f(td),
+		ropeCos: f(T * (dh / 2)), ropeSin: f(T * (dh / 2)),
+		scores: f(T * T), ds: f(T * T),
 		qh: f(T * dh), kh: f(T * dh), vh: f(T * dh), ctxh: f(T * dh),
 		gctxh: f(T * dh), dqh: f(T * dh),
 		kt: f(dh * T), vt: f(dh * T), gkt: f(dh * T), gvt: f(dh * T),
-		ds: f(T * T),
-		gh: f(td), gln1: f(td),
 		gq: f(td), gk: f(td), gv: f(td), gctx: f(td),
-		gh2:  f(td),
-		gln2: f(td), gpre: f(T * dff), ghid: f(T * dff),
-		gh3: f(td), glnf: f(td),
-		dx: f(td),
+		gh: f(td), gln1: f(td), gh2: f(td), gln2: f(td),
+		gpre: f(T * dff), ghid: f(T * dff), gh3: f(td), dx: f(td),
+		glnf: f(td), upstream: f(td),
+	}
+	for i := range ws.blocks {
+		ws.blocks[i] = layerAct{
+			h: f(td), ln1: f(td), ln1Mean: f(T), ln1Rstd: f(T),
+			q: f(td), k: f(td), v: f(td),
+			attn: f(h * T * T),
+			ctx:  f(td), ao: f(td), h2: f(td),
+			ln2: f(td), ln2Mean: f(T), ln2Rstd: f(T),
+			pre: f(T * dff), hid: f(T * dff), fo: f(td), h3: f(td),
+		}
+	}
+	buildRope(ws.ropeCos, ws.ropeSin, T, dh)
+	return ws
+}
+
+func buildRope(cos, sin []float32, T, Dh int) {
+	half := Dh / 2
+	for i := 0; i < half; i++ {
+		theta := math.Pow(10000, -float64(2*i)/float64(Dh))
+		for t := 0; t < T; t++ {
+			ang := float64(t) * theta
+			cos[t*half+i] = float32(math.Cos(ang))
+			sin[t*half+i] = float32(math.Sin(ang))
+		}
+	}
+}
+
+// applyRope rotates pairs of channels. sign -1 is the inverse rotation.
+func applyRope(x []float32, T, D, H, Dh int, cos, sin []float32, sign float32) {
+	half := Dh / 2
+	for t := 0; t < T; t++ {
+		cs := cos[t*half : (t+1)*half]
+		sn := sin[t*half : (t+1)*half]
+		for h := 0; h < H; h++ {
+			base := t*D + h*Dh
+			for i := 0; i < half; i++ {
+				x0 := x[base+2*i]
+				x1 := x[base+2*i+1]
+				c := cs[i]
+				s := sign * sn[i]
+				x[base+2*i] = x0*c - x1*s
+				x[base+2*i+1] = x0*s + x1*c
+			}
+		}
 	}
 }
 
@@ -267,37 +329,36 @@ func causalSoftmax(scores, attn []float32, T int) {
 	}
 }
 
-func attnForward(ws *workspace, scale float32) {
+func attnForward(ws *workspace, q, k, v, attn, ctx []float32, scale float32) {
 	T, H, Dh, D := ws.T, ws.H, ws.Dh, ws.D
 	for h := 0; h < H; h++ {
-		readHead(ws.q, T, D, h, Dh, ws.qh)
-		readHead(ws.k, T, D, h, Dh, ws.kh)
-		readHead(ws.v, T, D, h, Dh, ws.vh)
+		readHead(q, T, D, h, Dh, ws.qh)
+		readHead(k, T, D, h, Dh, ws.kh)
+		readHead(v, T, D, h, Dh, ws.vh)
 		transposeTD(ws.kh, T, Dh, ws.kt)
 		qkRows(ws.qh, ws.kt, T, Dh, scale, ws.scores)
-		ah := ws.attn[h*T*T : (h+1)*T*T]
+		ah := attn[h*T*T : (h+1)*T*T]
 		causalSoftmax(ws.scores, ah, T)
 		transposeTD(ws.vh, T, Dh, ws.vt)
 		avRows(ah, ws.vt, T, Dh, ws.ctxh)
-		writeHead(ws.ctx, T, D, h, Dh, ws.ctxh)
+		writeHead(ctx, T, D, h, Dh, ws.ctxh)
 	}
 }
 
-func attnBackward(ws *workspace, scale float32) {
+func attnBackward(ws *workspace, q, k, v, attn, gctx, gq, gk, gv []float32, scale float32) {
 	T, H, Dh, D := ws.T, ws.H, ws.Dh, ws.D
-	clear(ws.gq)
-	clear(ws.gk)
-	clear(ws.gv)
+	clear(gq)
+	clear(gk)
+	clear(gv)
 	for h := 0; h < H; h++ {
-		readHead(ws.q, T, D, h, Dh, ws.qh)
-		readHead(ws.k, T, D, h, Dh, ws.kh)
-		readHead(ws.v, T, D, h, Dh, ws.vh)
-		readHead(ws.gctx, T, D, h, Dh, ws.gctxh)
+		readHead(q, T, D, h, Dh, ws.qh)
+		readHead(k, T, D, h, Dh, ws.kh)
+		readHead(v, T, D, h, Dh, ws.vh)
+		readHead(gctx, T, D, h, Dh, ws.gctxh)
 		transposeTD(ws.kh, T, Dh, ws.kt)
 		transposeTD(ws.vh, T, Dh, ws.vt)
-		// dA[i, j] = dot(gctx[i], v[j]).
 		qkRows(ws.gctxh, ws.vt, T, Dh, 1, ws.scores)
-		ah := ws.attn[h*T*T : (h+1)*T*T]
+		ah := attn[h*T*T : (h+1)*T*T]
 		clear(ws.gvt)
 		for i := 0; i < T; i++ {
 			gi := ws.gctxh[i*Dh : (i+1)*Dh]
@@ -334,10 +395,84 @@ func attnBackward(ws *workspace, scale float32) {
 				axpy(ws.gkt[d*T:(d+1)*T], di, qi[d])
 			}
 		}
-		addHead(ws.gq, T, D, h, Dh, ws.dqh)
-		addTransposed(ws.gk, T, D, h, Dh, ws.gkt)
-		addTransposed(ws.gv, T, D, h, Dh, ws.gvt)
+		addHead(gq, T, D, h, Dh, ws.dqh)
+		addTransposed(gk, T, D, h, Dh, ws.gkt)
+		addTransposed(gv, T, D, h, Dh, ws.gvt)
 	}
+}
+
+func layerForward(st *layerAct, L *layer, ws *workspace, x []float32, scale float32) {
+	T, D, DFF := ws.T, ws.D, ws.DFF
+	copy(st.h[:T*D], x[:T*D])
+	layernorm(st.h, T, D, L.Ln1W, L.Ln1B, st.ln1, st.ln1Mean, st.ln1Rstd)
+	mul(st.ln1, T, D, L.Wq, D, st.q)
+	addBias(st.q, T, D, L.Bq)
+	mul(st.ln1, T, D, L.Wk, D, st.k)
+	addBias(st.k, T, D, L.Bk)
+	mul(st.ln1, T, D, L.Wv, D, st.v)
+	addBias(st.v, T, D, L.Bv)
+	applyRope(st.q, T, D, ws.H, ws.Dh, ws.ropeCos, ws.ropeSin, 1)
+	applyRope(st.k, T, D, ws.H, ws.Dh, ws.ropeCos, ws.ropeSin, 1)
+	attnForward(ws, st.q, st.k, st.v, st.attn, st.ctx, scale)
+	mul(st.ctx, T, D, L.Wo, D, st.ao)
+	addBias(st.ao, T, D, L.Bo)
+	for i := 0; i < T*D; i++ {
+		st.h2[i] = st.h[i] + st.ao[i]
+	}
+	layernorm(st.h2, T, D, L.Ln2W, L.Ln2B, st.ln2, st.ln2Mean, st.ln2Rstd)
+	mul(st.ln2, T, D, L.W1, DFF, st.pre)
+	addBias(st.pre, T, DFF, L.B1)
+	applyGelu(st.pre[:T*DFF], st.hid[:T*DFF])
+	mul(st.hid, T, DFF, L.W2, D, st.fo)
+	addBias(st.fo, T, D, L.B2)
+	for i := 0; i < T*D; i++ {
+		st.h3[i] = st.h2[i] + st.fo[i]
+	}
+}
+
+func layerBackward(st *layerAct, L, gL *layer, ws *workspace, gh3 []float32, scale float32) []float32 {
+	T, D, DFF := ws.T, ws.D, ws.DFF
+	copy(ws.upstream[:T*D], gh3[:T*D])
+
+	mulAT(st.hid, T, DFF, ws.upstream, D, gL.W2)
+	sumRows(ws.upstream, T, D, gL.B2)
+	mulBT(ws.upstream, T, D, L.W2, DFF, ws.ghid)
+	applyDGelu(st.pre[:T*DFF], ws.ghid[:T*DFF], ws.gpre[:T*DFF])
+	mulAT(st.ln2, T, D, ws.gpre, DFF, gL.W1)
+	sumRows(ws.gpre, T, DFF, gL.B1)
+	mulBT(ws.gpre, T, DFF, L.W1, D, ws.gln2)
+	layernormBackward(ws.gln2, st.h2, L.Ln2W, st.ln2Mean, st.ln2Rstd, T, D, ws.dx, gL.Ln2W, gL.Ln2B)
+	for i := 0; i < T*D; i++ {
+		ws.gh2[i] = ws.upstream[i] + ws.dx[i]
+	}
+
+	mulAT(st.ctx, T, D, ws.gh2, D, gL.Wo)
+	sumRows(ws.gh2, T, D, gL.Bo)
+	mulBT(ws.gh2, T, D, L.Wo, D, ws.gctx)
+	attnBackward(ws, st.q, st.k, st.v, st.attn, ws.gctx, ws.gq, ws.gk, ws.gv, scale)
+	applyRope(ws.gq, T, D, ws.H, ws.Dh, ws.ropeCos, ws.ropeSin, -1)
+	applyRope(ws.gk, T, D, ws.H, ws.Dh, ws.ropeCos, ws.ropeSin, -1)
+
+	mulAT(st.ln1, T, D, ws.gq, D, gL.Wq)
+	sumRows(ws.gq, T, D, gL.Bq)
+	mulBT(ws.gq, T, D, L.Wq, D, ws.gln1)
+	mulAT(st.ln1, T, D, ws.gk, D, gL.Wk)
+	sumRows(ws.gk, T, D, gL.Bk)
+	mulBT(ws.gk, T, D, L.Wk, D, ws.dx)
+	for i := 0; i < T*D; i++ {
+		ws.gln1[i] += ws.dx[i]
+	}
+	mulAT(st.ln1, T, D, ws.gv, D, gL.Wv)
+	sumRows(ws.gv, T, D, gL.Bv)
+	mulBT(ws.gv, T, D, L.Wv, D, ws.dx)
+	for i := 0; i < T*D; i++ {
+		ws.gln1[i] += ws.dx[i]
+	}
+	layernormBackward(ws.gln1, st.h, L.Ln1W, st.ln1Mean, st.ln1Rstd, T, D, ws.dx, gL.Ln1W, gL.Ln1B)
+	for i := 0; i < T*D; i++ {
+		ws.gh[i] = ws.gh2[i] + ws.dx[i]
+	}
+	return ws.gh
 }
 
 // rowCE is the cross-entropy of one next-byte distribution.
@@ -378,67 +513,70 @@ func rowCE(logits []float32, target int, dlogits []float32) (loss float64, corre
 	return loss, correct
 }
 
-// forwardBackward runs one window. text must be Context bytes.
-// Loss is the mean next-byte cross-entropy over the first Context-1 positions.
-// A nil g skips the backward pass. Gradients are the derivative of that mean.
-func forwardBackward(cfg Config, w, g *tensors, ws *workspace, text []byte) (loss float64, correct int) {
-	T, D, V := cfg.Context, cfg.D, cfg.Vocab
-	if ws.T != T || ws.D != D || ws.V != V || len(text) != T {
+// lossSpan clamps a target range onto [1, n). n is the text length.
+func lossSpan(n, tgtLo, tgtHi int) (lo, hi int) {
+	lo, hi = tgtLo, tgtHi
+	if lo < 1 {
+		lo = 1
+	}
+	if hi > n {
+		hi = n
+	}
+	return lo, hi
+}
+
+// forwardBackward runs one causal sequence.
+// The active length is the end of the loss span: bytes at that index and
+// beyond are not inputs. Training on a prefix therefore cannot attend to
+// the held-out tail. Scoring the tail passes a span that ends at the last
+// byte, so the prefix remains context. Loss is the mean cross-entropy of
+// targets in [tgtLo, tgtHi). A nil g skips the backward pass.
+func forwardBackward(cfg Config, w, g *tensors, ws *workspace, text []byte, tgtLo, tgtHi int) (loss float64, correct int) {
+	D, V := cfg.D, cfg.Vocab
+	if ws.maxT < 2 || ws.D != D || ws.V != V || ws.H != cfg.Heads || len(ws.blocks) != len(w.Layers) || len(text) < 2 || len(text) > ws.maxT {
 		panic("batch shape")
 	}
+	tgtLo, tgtHi = lossSpan(len(text), tgtLo, tgtHi)
+	if tgtHi <= tgtLo {
+		panic("loss span")
+	}
+	// Positions at and after tgtHi do not predict a scored byte, and a
+	// causal model cannot need them as inputs to earlier positions.
+	ws.T = tgtHi
+	T := ws.T
+	text = text[:T]
 	for i := 0; i < T; i++ {
 		id := int(text[i])
 		if id < 0 || id >= V {
 			panic("byte out of vocab")
 		}
-		hi := ws.h[i*D : (i+1)*D]
+		hi := ws.tok[i*D : (i+1)*D]
 		ei := w.Emb[id*D : (id+1)*D]
-		pi := w.Pos[i*D : (i+1)*D]
-		for d := 0; d < D; d++ {
-			hi[d] = ei[d] + pi[d]
-		}
+		copy(hi, ei)
 	}
-	Dh, DFF := ws.Dh, ws.DFF
-	scale := 1 / sqrt32(float32(Dh))
-
-	layernorm(ws.h, T, D, w.Ln1W, w.Ln1B, ws.ln1, ws.ln1Mean, ws.ln1Rstd)
-	mul(ws.ln1, T, D, w.Wq, D, ws.q)
-	addBias(ws.q, T, D, w.Bq)
-	mul(ws.ln1, T, D, w.Wk, D, ws.k)
-	addBias(ws.k, T, D, w.Bk)
-	mul(ws.ln1, T, D, w.Wv, D, ws.v)
-	addBias(ws.v, T, D, w.Bv)
-	attnForward(ws, scale)
-	mul(ws.ctx, T, D, w.Wo, D, ws.ao)
-	addBias(ws.ao, T, D, w.Bo)
-	for i := 0; i < T*D; i++ {
-		ws.h2[i] = ws.h[i] + ws.ao[i]
+	scale := 1 / sqrt32(float32(ws.Dh))
+	x := ws.tok
+	for i := range w.Layers {
+		layerForward(&ws.blocks[i], &w.Layers[i], ws, x, scale)
+		x = ws.blocks[i].h3
 	}
-	layernorm(ws.h2, T, D, w.Ln2W, w.Ln2B, ws.ln2, ws.ln2Mean, ws.ln2Rstd)
-	mul(ws.ln2, T, D, w.W1, DFF, ws.pre)
-	addBias(ws.pre, T, DFF, w.B1)
-	applyGelu(ws.pre, ws.hid)
-	mul(ws.hid, T, DFF, w.W2, D, ws.fo)
-	addBias(ws.fo, T, D, w.B2)
-	for i := 0; i < T*D; i++ {
-		ws.h3[i] = ws.h2[i] + ws.fo[i]
-	}
-	layernorm(ws.h3, T, D, w.LnFW, w.LnFB, ws.lnf, ws.lnfMean, ws.lnfRstd)
-	mul(ws.lnf, T, D, w.Wh, V, ws.logits)
+	layernorm(x, T, D, w.LnFW, w.LnFB, ws.lnf, ws.lnfMean, ws.lnfRstd)
+	mulBT(ws.lnf, T, D, w.Emb, V, ws.logits)
 	addBias(ws.logits, T, V, w.Bh)
 
-	npred := T - 1
+	npred := tgtHi - tgtLo
 	var dlogits []float32
 	if g != nil {
 		clear(ws.glogits)
 		dlogits = ws.glogits
 	}
-	for i := 0; i < npred; i++ {
+	for tgt := tgtLo; tgt < tgtHi; tgt++ {
+		i := tgt - 1
 		var grow []float32
 		if dlogits != nil {
 			grow = dlogits[i*V : (i+1)*V]
 		}
-		li, c := rowCE(ws.logits[i*V:(i+1)*V], int(text[i+1]), grow)
+		li, c := rowCE(ws.logits[i*V:(i+1)*V], int(text[tgt]), grow)
 		loss += li
 		correct += c
 	}
@@ -447,60 +585,31 @@ func forwardBackward(cfg Config, w, g *tensors, ws *workspace, text []byte) (los
 		return loss, correct
 	}
 	inv := float32(1 / float64(npred))
-	for i := 0; i < npred*V; i++ {
-		ws.glogits[i] *= inv
+	for tgt := tgtLo; tgt < tgtHi; tgt++ {
+		i := tgt - 1
+		row := ws.glogits[i*V : (i+1)*V]
+		for j := range row {
+			row[j] *= inv
+		}
 	}
 	g.zero()
 
-	mulAT(ws.lnf, T, D, ws.glogits, V, g.Wh)
+	// Tied output: dEmb = glogits^T @ lnf, dlnf = glogits @ Emb.
+	mulAT(ws.glogits, T, V, ws.lnf, D, g.Emb)
 	sumRows(ws.glogits, T, V, g.Bh)
-	mulBT(ws.glogits, T, V, w.Wh, D, ws.glnf)
-	layernormBackward(ws.glnf, ws.h3, w.LnFW, ws.lnfMean, ws.lnfRstd, T, D, ws.gh3, g.LnFW, g.LnFB)
+	mul(ws.glogits, T, V, w.Emb, D, ws.glnf)
+	layernormBackward(ws.glnf, x, w.LnFW, ws.lnfMean, ws.lnfRstd, T, D, ws.dx, g.LnFW, g.LnFB)
 
-	mulAT(ws.hid, T, DFF, ws.gh3, D, g.W2)
-	sumRows(ws.gh3, T, D, g.B2)
-	mulBT(ws.gh3, T, D, w.W2, DFF, ws.ghid)
-	applyDGelu(ws.pre, ws.ghid, ws.gpre)
-	mulAT(ws.ln2, T, D, ws.gpre, DFF, g.W1)
-	sumRows(ws.gpre, T, DFF, g.B1)
-	mulBT(ws.gpre, T, DFF, w.W1, D, ws.gln2)
-	layernormBackward(ws.gln2, ws.h2, w.Ln2W, ws.ln2Mean, ws.ln2Rstd, T, D, ws.dx, g.Ln2W, g.Ln2B)
-	for i := 0; i < T*D; i++ {
-		ws.gh2[i] = ws.gh3[i] + ws.dx[i]
-	}
-
-	mulAT(ws.ctx, T, D, ws.gh2, D, g.Wo)
-	sumRows(ws.gh2, T, D, g.Bo)
-	mulBT(ws.gh2, T, D, w.Wo, D, ws.gctx)
-	attnBackward(ws, scale)
-
-	mulAT(ws.ln1, T, D, ws.gq, D, g.Wq)
-	sumRows(ws.gq, T, D, g.Bq)
-	mulBT(ws.gq, T, D, w.Wq, D, ws.gln1)
-	mulAT(ws.ln1, T, D, ws.gk, D, g.Wk)
-	sumRows(ws.gk, T, D, g.Bk)
-	mulBT(ws.gk, T, D, w.Wk, D, ws.dx)
-	for i := 0; i < T*D; i++ {
-		ws.gln1[i] += ws.dx[i]
-	}
-	mulAT(ws.ln1, T, D, ws.gv, D, g.Wv)
-	sumRows(ws.gv, T, D, g.Bv)
-	mulBT(ws.gv, T, D, w.Wv, D, ws.dx)
-	for i := 0; i < T*D; i++ {
-		ws.gln1[i] += ws.dx[i]
-	}
-	layernormBackward(ws.gln1, ws.h, w.Ln1W, ws.ln1Mean, ws.ln1Rstd, T, D, ws.dx, g.Ln1W, g.Ln1B)
-	for i := 0; i < T*D; i++ {
-		ws.gh[i] = ws.gh2[i] + ws.dx[i]
+	grad := ws.dx
+	for i := len(w.Layers) - 1; i >= 0; i-- {
+		grad = layerBackward(&ws.blocks[i], &w.Layers[i], &g.Layers[i], ws, grad, scale)
 	}
 	for i := 0; i < T; i++ {
 		id := int(text[i])
-		gh := ws.gh[i*D : (i+1)*D]
+		gh := grad[i*D : (i+1)*D]
 		ge := g.Emb[id*D : (id+1)*D]
-		gp := g.Pos[i*D : (i+1)*D]
 		for d := 0; d < D; d++ {
 			ge[d] += gh[d]
-			gp[d] += gh[d]
 		}
 	}
 	return loss, correct

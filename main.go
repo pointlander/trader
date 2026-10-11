@@ -4,16 +4,18 @@
 
 // Command trader simulates a distributed next-byte model.
 //
-// There are N transformers. Each is one pre-norm causal layer with context
-// length 1024. The corpus is pg100.txt. N non-overlapping 1024-byte windows
-// are spread across the file, one per transformer. Each transformer is
-// trained on its own window.
+// There are N transformers. Each is two pre-norm causal layers with rotary
+// positions and a byte embedding tied to the output projection. The corpus
+// is pg100.txt. Works are the plays and poems named in the contents. Each
+// transformer is given several consecutive windows from a single work.
 //
-// Trading then draws random pairs. A pair exchanges windows when each model
-// has a lower next-byte loss on the other's window than on its own. Both
-// models train on the window they receive, and that window becomes the text
-// they hold. A pair that fails the test keeps its windows. The multiset of
-// windows is unchanged; only the owners move.
+// A window's first bytes are the training span. Its tail is held out and is
+// the only loss used to decide a trade. The training forward stops at the
+// end of that span, so the tail is not an input. Each cycle trains every
+// node on its own windows, then builds a random perfect matching. A pair
+// exchanges the window each model scores worst when that exchange lowers
+// the sum of the two held-out losses. Both models then train on the window
+// they received. The multiset of windows is unchanged.
 //
 // Build and run with the simd experiment:
 //
@@ -28,6 +30,8 @@ import (
 	"math/rand/v2"
 	"os"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,33 +50,43 @@ func run(args []string) error {
 	fs := flag.NewFlagSet("trader", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	file := fs.String("file", "pg100.txt", "corpus file")
-	nodesN := fs.Int("nodes", 1024, "transformers, and windows assigned to them")
+	nodesN := fs.Int("nodes", 1024, "transformers")
 	context := fs.Int("context", 1024, "bytes per window and context length")
-	steps := fs.Int("steps", 8, "Adam steps on a node's own window before trading")
-	rounds := fs.Int("rounds", 1024, "random pairs drawn during trading")
-	adopt := fs.Int("adopt", 4, "Adam steps on a received window after an accepted trade")
+	holdout := fs.Int("holdout", 256, "trailing bytes scored and withheld from training")
+	perNode := fs.Int("windows", 4, "windows each node starts with, all from one work")
+	steps := fs.Int("steps", 4, "Adam steps on a node's own windows each cycle")
+	cycles := fs.Int("cycles", 4, "train-then-match cycles")
+	adopt := fs.Int("adopt", 2, "Adam steps on a received window after a swap")
 	lr := fs.Float64("lr", 3e-3, "Adam learning rate")
 	seed := fs.Int64("seed", 1, "rng seed")
-	workers := fs.Int("workers", 0, "training workers (0 uses GOMAXPROCS)")
+	workers := fs.Int("workers", 0, "workers (0 uses GOMAXPROCS)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
-	if *nodesN < 1 {
-		return fmt.Errorf("-nodes must be positive")
+	if *nodesN < 2 {
+		return fmt.Errorf("-nodes must be at least 2")
 	}
-	if *steps < 0 || *rounds < 0 || *adopt < 0 {
-		return fmt.Errorf("-steps, -rounds, and -adopt must be non-negative")
+	if *perNode < 2 {
+		return fmt.Errorf("-windows must be at least 2")
+	}
+	if *steps < 0 || *cycles < 0 || *adopt < 0 {
+		return fmt.Errorf("-steps, -cycles, and -adopt must be non-negative")
 	}
 	if !(*lr > 0) {
 		return fmt.Errorf("-lr must be positive")
+	}
+	if *holdout < 1 || *holdout >= *context-1 {
+		return fmt.Errorf("-holdout must leave a training prefix and a scored tail")
 	}
 	cfg := simConfig(*context)
 	if err := cfg.validate(); err != nil {
 		return fmt.Errorf("context %d is below 2", *context)
 	}
+	trainHi := *context - *holdout
+	holdLo := trainHi
 	nw := *workers
 	if nw < 1 {
 		nw = runtime.GOMAXPROCS(0)
@@ -82,181 +96,383 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	starts, err := windowStarts(len(data), cfg.Context, *nodesN)
+	works, err := parseWorks(data)
 	if err != nil {
 		return err
 	}
-
-	nodes := make([]node, *nodesN)
+	nodes, err := assignNodes(data, works, *nodesN, cfg.Context, *perNode, *seed)
+	if err != nil {
+		return err
+	}
+	plays := map[string]struct{}{}
+	for i := range nodes {
+		plays[nodes[i].origin] = struct{}{}
+	}
 	for i := range nodes {
 		w := newTensors(cfg)
 		initTensors(w, rand.New(rand.NewPCG(uint64(*seed)+uint64(i)*0x9e3779b97f4a7c15, uint64(i)+1)))
-		nodes[i] = node{
-			id:   i,
-			src:  i,
-			text: data[starts[i] : starts[i]+cfg.Context],
-			w:    w,
-			opt:  newAdam(w),
-		}
+		nodes[i].w = w
+		nodes[i].opt = newAdam(w)
+		nodes[i].rng = rand.New(rand.NewPCG(uint64(*seed)+uint64(i)*0xbf58476d1ce4e5b9, uint64(i)+3))
 	}
-	fmt.Printf("corpus %s bytes=%d\n", *file, len(data))
-	fmt.Printf("nodes=%d context=%d d=%d heads=%d dff=%d params=%d workers=%d\n",
-		len(nodes), cfg.Context, cfg.D, cfg.Heads, cfg.DFF, paramCount(nodes[0].w), nw)
-	fmt.Printf("windows spread across the file, offsets %d..%d\n", starts[0], starts[len(starts)-1])
 
-	tTrain := time.Now()
-	if err := trainNodes(nodes, cfg, *steps, float32(*lr), nw); err != nil {
+	say("corpus %s bytes=%d works=%d\n", *file, len(data), len(works))
+	say("nodes=%d context=%d windows=%d train=%d holdout=%d layers=%d d=%d heads=%d dff=%d params=%d workers=%d plays=%d\n",
+		len(nodes), cfg.Context, *perNode, trainHi, *holdout, cfg.Layers, cfg.D, cfg.Heads, cfg.DFF, paramCount(nodes[0].w), nw, len(plays))
+	say("rotary positions, tied byte embedding\n")
+
+	if err := scoreAll(nodes, cfg, holdLo, cfg.Context, nw, true); err != nil {
 		return err
 	}
-	fmt.Printf("trained in %s\n", time.Since(tTrain).Round(time.Millisecond))
-	initMean, trainMean, trainMin, trainMax, trainAcc := lossStats(nodes)
-	fmt.Printf("init    mean=%.4f nats (%.3f bits)\n", initMean, initMean/math.Ln2)
-	fmt.Printf("trained mean=%.4f min=%.4f max=%.4f acc=%.4f\n", trainMean, trainMin, trainMax, trainAcc)
+	initMean, _, _, _, initAcc := lossStats(nodes)
+	say("init    holdout mean=%.4f nats (%.3f bits) acc=%.4f\n", initMean, initMean/math.Ln2, initAcc)
 
+	var trainedMean float64
+	var traded int
 	rng := rand.New(rand.NewPCG(uint64(*seed), 0x6a09e667f3bcc909))
-	var traded, oneSided, neither int
-	var ownSum, crossSum float64
-	var scored int
-	tTrade := time.Now()
-	if *rounds > 0 && len(nodes) >= 2 {
-		ws := newWorkspace(cfg)
-		g := newTensors(cfg)
-		every := *rounds / 16
-		if every < 1 {
-			every = 1
-		}
-		for r := 0; r < *rounds; r++ {
-			i := rng.IntN(len(nodes))
-			j := rng.IntN(len(nodes) - 1)
-			if j >= i {
-				j++
-			}
-			outcome, ownI, crossI, ownJ, crossJ, err := considerPair(&nodes[i], &nodes[j], cfg, ws, g, *adopt, float32(*lr))
-			if err != nil {
+	for c := 0; c < *cycles; c++ {
+		t0 := time.Now()
+		if *steps > 0 {
+			if err := trainAll(nodes, cfg, *steps, 1, trainHi, float32(*lr), nw); err != nil {
 				return err
 			}
-			ownSum += ownI + ownJ
-			crossSum += crossI + crossJ
-			scored += 2
-			switch outcome {
-			case pairTrade:
-				traded++
-			case pairOne:
-				oneSided++
-			default:
-				neither++
-			}
-			if (r+1)%every == 0 || r+1 == *rounds {
-				fmt.Printf("round %4d/%d traded=%d one-sided=%d neither=%d %s\n",
-					r+1, *rounds, traded, oneSided, neither, time.Since(tTrade).Round(time.Millisecond))
-			}
 		}
-	} else {
-		fmt.Println("trading skipped")
+		if err := scoreAll(nodes, cfg, holdLo, cfg.Context, nw, false); err != nil {
+			return err
+		}
+		if c == 0 {
+			trainedMean, _, _, _, _ = lossStats(nodes)
+		}
+		swaps, pairs, err := matchAll(nodes, cfg, rng, *adopt, 1, trainHi, holdLo, cfg.Context, float32(*lr), nw)
+		if err != nil {
+			return err
+		}
+		traded += swaps
+		mean, _, _, _, acc := lossStats(nodes)
+		say("cycle %d/%d holdout mean=%.4f acc=%.4f swaps=%d/%d %s\n",
+			c+1, *cycles, mean, acc, swaps, pairs, time.Since(t0).Round(time.Millisecond))
 	}
-	fmt.Printf("traded in %s\n", time.Since(tTrade).Round(time.Millisecond))
+	if *cycles == 0 && *steps > 0 {
+		if err := trainAll(nodes, cfg, *steps, 1, trainHi, float32(*lr), nw); err != nil {
+			return err
+		}
+		if err := scoreAll(nodes, cfg, holdLo, cfg.Context, nw, false); err != nil {
+			return err
+		}
+		trainedMean, _, _, _, _ = lossStats(nodes)
+	}
 
-	postMean, postMin, postMax := currentLoss(nodes)
-	fmt.Printf("pairs=%d traded=%d one-sided=%d neither=%d\n", traded+oneSided+neither, traded, oneSided, neither)
-	if scored > 0 {
-		fmt.Printf("pair mean own=%.4f traded=%.4f\n", ownSum/float64(scored), crossSum/float64(scored))
-		fmt.Printf("traded text had lower loss in %d/%d comparisons\n", oneSided+2*traded, scored)
-	}
-	fmt.Printf("post    mean=%.4f min=%.4f max=%.4f\n", postMean, postMin, postMax)
-	if err := checkPermutation(nodes); err != nil {
+	postMean, postMin, postMax, postAcc := currentStats(nodes)
+	say("trained holdout mean=%.4f\n", trainedMean)
+	say("post    holdout mean=%.4f min=%.4f max=%.4f acc=%.4f swaps=%d\n",
+		postMean, postMin, postMax, postAcc, traded)
+	nChunks, err := checkChunks(nodes)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("unique windows=%d\n", len(nodes))
-	printSamples(nodes, starts)
+	say("unique windows=%d\n", nChunks)
+	printSamples(nodes)
 
 	ln := math.Log(float64(cfg.Vocab))
 	if math.Abs(initMean-ln) > 1 {
-		return fmt.Errorf("verification failed: initial loss %.3f is far from ln(%d)=%.3f", initMean, cfg.Vocab, ln)
+		return fmt.Errorf("verification failed: initial holdout %.3f is far from ln(%d)=%.3f", initMean, cfg.Vocab, ln)
 	}
-	if *steps > 0 && !(trainMean < initMean-0.25) {
-		return fmt.Errorf("verification failed: mean loss %.4f -> %.4f did not fall by 0.25 nats", initMean, trainMean)
+	if *steps > 0 && !(trainedMean < initMean-0.05) {
+		return fmt.Errorf("verification failed: holdout %.4f -> %.4f did not fall by 0.05 nats", initMean, trainedMean)
 	}
 	for i := range nodes {
 		if math.IsNaN(nodes[i].own) || math.IsInf(nodes[i].own, 0) {
 			return fmt.Errorf("verification failed: node %d loss is non-finite", i)
 		}
 	}
-	fmt.Println("verified")
+	say("verified\n")
 	return nil
+}
+
+func say(format string, args ...any) {
+	fmt.Printf(format, args...)
+	os.Stdout.Sync()
+}
+
+type chunk struct {
+	id   int
+	work string
+	off  int
+	text []byte
+	hold float64
+	acc  float64
 }
 
 type node struct {
 	id     int
-	src    int
-	text   []byte
+	origin string
+	bag    []chunk
 	w      *tensors
 	opt    *adam
+	rng    *rand.Rand
 	base   float64
 	own    float64
 	acc    float64
 	trades int
 }
 
-const (
-	pairNeither = 0
-	pairOne     = 1
-	pairTrade   = 2
-)
-
-// considerPair trades windows when both models score the other's text lower
-// than their own. The returned own and cross losses are the pre-trade values
-// the test used. After an accepted trade, each node trains on the window it
-// received and own is refreshed.
-func considerPair(a, b *node, cfg Config, ws *workspace, g *tensors, adopt int, lr float32) (outcome int, ownA, crossA, ownB, crossB float64, err error) {
-	ownA, ownB = a.own, b.own
-	crossA, _, err = finiteLoss(cfg, a.w, ws, b.text)
-	if err != nil {
-		return 0, 0, 0, 0, 0, err
-	}
-	crossB, _, err = finiteLoss(cfg, b.w, ws, a.text)
-	if err != nil {
-		return 0, 0, 0, 0, 0, err
-	}
-	aWants := crossA < ownA
-	bWants := crossB < ownB
-	if !(aWants && bWants) {
-		if aWants || bWants {
-			return pairOne, ownA, crossA, ownB, crossB, nil
-		}
-		return pairNeither, ownA, crossA, ownB, crossB, nil
-	}
-	a.text, b.text = b.text, a.text
-	a.src, b.src = b.src, a.src
-	for s := 0; s < adopt; s++ {
-		if _, err = learnStep(cfg, a.w, g, a.opt, ws, a.text, lr); err != nil {
-			return 0, 0, 0, 0, 0, err
-		}
-		if _, err = learnStep(cfg, b.w, g, b.opt, ws, b.text, lr); err != nil {
-			return 0, 0, 0, 0, 0, err
-		}
-	}
-	if a.own, a.acc, err = finiteLoss(cfg, a.w, ws, a.text); err != nil {
-		return 0, 0, 0, 0, 0, err
-	}
-	if b.own, b.acc, err = finiteLoss(cfg, b.w, ws, b.text); err != nil {
-		return 0, 0, 0, 0, 0, err
-	}
-	a.trades++
-	b.trades++
-	return pairTrade, ownA, crossA, ownB, crossB, nil
+type work struct {
+	name       string
+	start, end int
 }
 
-func finiteLoss(cfg Config, w *tensors, ws *workspace, text []byte) (float64, float64, error) {
-	loss, correct := forwardBackward(cfg, w, nil, ws, text)
+func parseWorks(data []byte) ([]work, error) {
+	lines := splitLines(data)
+	tocEnd := -1
+	var titles []string
+	inTOC := false
+	for _, ln := range lines {
+		trim := strings.TrimSpace(ln.text)
+		if !inTOC && trim == "Contents" && len(titles) == 0 {
+			inTOC = true
+			continue
+		}
+		if !inTOC {
+			continue
+		}
+		if trim == "" {
+			if len(titles) > 0 {
+				tocEnd = ln.start
+				break
+			}
+			continue
+		}
+		titles = append(titles, trim)
+	}
+	if len(titles) < 2 || tocEnd < 0 {
+		return nil, fmt.Errorf("contents list not found")
+	}
+	var found []work
+	for _, title := range titles {
+		off := -1
+		for _, ln := range lines {
+			if ln.start < tocEnd {
+				continue
+			}
+			if ln.text == title {
+				off = ln.start
+				break
+			}
+		}
+		if off < 0 {
+			return nil, fmt.Errorf("work %q is not in the body", title)
+		}
+		found = append(found, work{name: title, start: off})
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].start < found[j].start })
+	limit := len(data)
+	if i := strings.Index(string(data), "\n*** END OF THE PROJECT GUTENBERG"); i >= 0 {
+		limit = i + 1
+	}
+	for i := range found {
+		if i+1 < len(found) {
+			found[i].end = found[i+1].start
+		} else {
+			found[i].end = limit
+		}
+		if found[i].end < found[i].start {
+			return nil, fmt.Errorf("work %q has a bad span", found[i].name)
+		}
+	}
+	return found, nil
+}
+
+type fileLine struct {
+	start int
+	text  string
+}
+
+func splitLines(data []byte) []fileLine {
+	var lines []fileLine
+	i := 0
+	for i < len(data) {
+		j := i
+		for j < len(data) && data[j] != '\n' {
+			j++
+		}
+		text := string(data[i:j])
+		text = strings.TrimRight(text, "\r")
+		lines = append(lines, fileLine{start: i, text: text})
+		if j < len(data) {
+			j++
+		}
+		i = j
+	}
+	return lines
+}
+
+// sceneStart is the first ACT or SCENE line in the work, so a play's
+// contents page is not the text the model fits. Poems stay at the title.
+func sceneStart(data []byte, start, end int) int {
+	lines := splitLines(data[start:end])
+	for _, ln := range lines {
+		trim := strings.TrimSpace(ln.text)
+		if strings.HasPrefix(trim, "ACT ") || strings.HasPrefix(trim, "SCENE ") {
+			return start + ln.start
+		}
+	}
+	return start
+}
+
+func assignNodes(data []byte, works []work, nodes, context, perNode int, seed int64) ([]node, error) {
+	type pool struct {
+		name string
+		offs []int
+	}
+	var pools []pool
+	for _, w := range works {
+		body := sceneStart(data, w.start, w.end)
+		var offs []int
+		for off := body; off+context <= w.end; off += context {
+			offs = append(offs, off)
+		}
+		if len(offs) >= perNode {
+			pools = append(pools, pool{w.name, offs})
+		}
+	}
+	caps := make([]int, len(pools))
+	weights := make([]int, len(pools))
+	for i, p := range pools {
+		caps[i] = len(p.offs) / perNode
+		weights[i] = len(p.offs)
+	}
+	alloc, err := allocateNodes(weights, caps, nodes)
+	if err != nil {
+		return nil, err
+	}
+	rng := rand.New(rand.NewPCG(uint64(seed), 99))
+	var out []node
+	nextID := 0
+	for i, p := range pools {
+		n := alloc[i]
+		if n == 0 {
+			continue
+		}
+		offs := append([]int(nil), p.offs...)
+		rng.Shuffle(len(offs), func(a, b int) { offs[a], offs[b] = offs[b], offs[a] })
+		use := n * perNode
+		offs = offs[:use]
+		sort.Ints(offs)
+		for k := 0; k < n; k++ {
+			bag := make([]chunk, perNode)
+			for j := 0; j < perNode; j++ {
+				off := offs[k*perNode+j]
+				bag[j] = chunk{
+					id:   nextID,
+					work: p.name,
+					off:  off,
+					text: data[off : off+context],
+				}
+				nextID++
+			}
+			out = append(out, node{id: len(out), origin: p.name, bag: bag})
+		}
+	}
+	if len(out) != nodes {
+		return nil, fmt.Errorf("assigned %d nodes, need %d", len(out), nodes)
+	}
+	return out, nil
+}
+
+// allocateNodes spreads `nodes` seats across works, proportional to weight,
+// never past cap. A cap of zero gets no seats.
+func allocateNodes(weight, cap []int, nodes int) ([]int, error) {
+	if len(weight) != len(cap) {
+		return nil, fmt.Errorf("allocation shape")
+	}
+	totalCap := 0
+	sumW := 0
+	for i := range weight {
+		if cap[i] < 0 || weight[i] < 0 {
+			return nil, fmt.Errorf("allocation shape")
+		}
+		totalCap += cap[i]
+		if cap[i] > 0 {
+			sumW += weight[i]
+		}
+	}
+	if totalCap < nodes {
+		return nil, fmt.Errorf("only %d nodes can each hold the requested windows from one work, need %d", totalCap, nodes)
+	}
+	alloc := make([]int, len(weight))
+	assigned := 0
+	type rem struct {
+		i int
+		f float64
+	}
+	var order []rem
+	for i := range weight {
+		if cap[i] == 0 || sumW == 0 {
+			continue
+		}
+		exact := float64(nodes) * float64(weight[i]) / float64(sumW)
+		n := int(exact)
+		if n > cap[i] {
+			n = cap[i]
+		}
+		alloc[i] = n
+		assigned += n
+		order = append(order, rem{i, exact - float64(n)})
+	}
+	sort.Slice(order, func(a, b int) bool { return order[a].f > order[b].f })
+	for assigned < nodes {
+		moved := false
+		for _, r := range order {
+			if alloc[r.i] < cap[r.i] {
+				alloc[r.i]++
+				assigned++
+				moved = true
+				if assigned == nodes {
+					break
+				}
+			}
+		}
+		if !moved {
+			return nil, fmt.Errorf("could not assign %d nodes", nodes)
+		}
+	}
+	return alloc, nil
+}
+
+func worstIndex(n *node) int {
+	bi := 0
+	for i := 1; i < len(n.bag); i++ {
+		if n.bag[i].hold > n.bag[bi].hold {
+			bi = i
+		}
+	}
+	return bi
+}
+
+func refreshOwn(n *node) {
+	var sum, acc float64
+	for _, c := range n.bag {
+		sum += c.hold
+		acc += c.acc
+	}
+	n.own = sum / float64(len(n.bag))
+	n.acc = acc / float64(len(n.bag))
+}
+
+func finiteLoss(cfg Config, w *tensors, ws *workspace, text []byte, tgtLo, tgtHi int) (float64, float64, error) {
+	lo, hi := lossSpan(len(text), tgtLo, tgtHi)
+	if hi <= lo {
+		return 0, 0, fmt.Errorf("loss span")
+	}
+	loss, correct := forwardBackward(cfg, w, nil, ws, text, tgtLo, tgtHi)
 	if math.IsNaN(loss) || math.IsInf(loss, 0) {
 		return 0, 0, fmt.Errorf("non-finite loss")
 	}
-	acc := float64(correct) / float64(cfg.preds())
-	return loss, acc, nil
+	return loss, float64(correct) / float64(hi-lo), nil
 }
 
-func learnStep(cfg Config, w, g *tensors, opt *adam, ws *workspace, text []byte, lr float32) (float64, error) {
-	loss, _ := forwardBackward(cfg, w, g, ws, text)
+func learnStep(cfg Config, w, g *tensors, opt *adam, ws *workspace, text []byte, tgtLo, tgtHi int, lr float32) (float64, error) {
+	loss, _ := forwardBackward(cfg, w, g, ws, text, tgtLo, tgtHi)
 	if math.IsNaN(loss) || math.IsInf(loss, 0) {
 		return 0, fmt.Errorf("non-finite loss")
 	}
@@ -268,71 +484,51 @@ func learnStep(cfg Config, w, g *tensors, opt *adam, ws *workspace, text []byte,
 	return loss, nil
 }
 
-func trainNodes(nodes []node, cfg Config, steps int, lr float32, workers int) error {
-	var next atomic.Int64
-	var mu sync.Mutex
-	done := 0
-	errc := make(chan error, workers)
-	start := time.Now()
-	stop := make(chan struct{})
-	go func() {
-		t := time.NewTicker(2 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-t.C:
-				mu.Lock()
-				d := done
-				mu.Unlock()
-				if d >= len(nodes) {
-					return
-				}
-				fmt.Printf("train %d/%d %s\n", d, len(nodes), time.Since(start).Round(time.Second))
-			}
+func scoreNode(n *node, cfg Config, ws *workspace, tgtLo, tgtHi int) error {
+	for i := range n.bag {
+		loss, acc, err := finiteLoss(cfg, n.w, ws, n.bag[i].text, tgtLo, tgtHi)
+		if err != nil {
+			return err
 		}
-	}()
+		n.bag[i].hold = loss
+		n.bag[i].acc = acc
+	}
+	refreshOwn(n)
+	return nil
+}
+
+func parallel(n, workers int, cfg Config, grad bool, fn func(i int, ws *workspace, g *tensors) error) error {
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > n {
+		workers = n
+	}
+	var next atomic.Int64
+	errc := make(chan error, workers)
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	for w := 0; w < workers; w++ {
 		go func() {
 			defer wg.Done()
 			ws := newWorkspace(cfg)
-			g := newTensors(cfg)
+			var g *tensors
+			if grad {
+				g = newTensors(cfg)
+			}
 			for {
 				i := int(next.Add(1) - 1)
-				if i >= len(nodes) {
+				if i >= n {
 					return
 				}
-				n := &nodes[i]
-				base, _, err := finiteLoss(cfg, n.w, ws, n.text)
-				if err != nil {
-					errc <- fmt.Errorf("node %d: %w", n.id, err)
+				if err := fn(i, ws, g); err != nil {
+					errc <- err
 					return
 				}
-				for s := 0; s < steps; s++ {
-					if _, err = learnStep(cfg, n.w, g, n.opt, ws, n.text, lr); err != nil {
-						errc <- fmt.Errorf("node %d: %w", n.id, err)
-						return
-					}
-				}
-				own, acc, err := finiteLoss(cfg, n.w, ws, n.text)
-				if err != nil {
-					errc <- fmt.Errorf("node %d: %w", n.id, err)
-					return
-				}
-				n.base = base
-				n.own = own
-				n.acc = acc
-				mu.Lock()
-				done++
-				mu.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
-	close(stop)
 	close(errc)
 	for err := range errc {
 		if err != nil {
@@ -342,70 +538,243 @@ func trainNodes(nodes []node, cfg Config, steps int, lr float32, workers int) er
 	return nil
 }
 
-func lossStats(nodes []node) (initMean, trainMean, trainMin, trainMax, trainAcc float64) {
-	trainMin = math.Inf(1)
-	for i := range nodes {
-		initMean += nodes[i].base
-		trainMean += nodes[i].own
-		trainAcc += nodes[i].acc
-		if nodes[i].own < trainMin {
-			trainMin = nodes[i].own
+func scoreAll(nodes []node, cfg Config, tgtLo, tgtHi, workers int, init bool) error {
+	err := parallel(len(nodes), workers, cfg, false, func(i int, ws *workspace, _ *tensors) error {
+		if err := scoreNode(&nodes[i], cfg, ws, tgtLo, tgtHi); err != nil {
+			return fmt.Errorf("node %d: %w", i, err)
 		}
-		if nodes[i].own > trainMax {
-			trainMax = nodes[i].own
+		if init {
+			nodes[i].base = nodes[i].own
+		}
+		return nil
+	})
+	return err
+}
+
+// trainAll takes steps Adam updates on each node. An update reads one
+// random window and stops at tgtHi, so a held-out tail is not an input.
+func trainAll(nodes []node, cfg Config, steps, tgtLo, tgtHi int, lr float32, workers int) error {
+	return parallel(len(nodes), workers, cfg, true, func(i int, ws *workspace, g *tensors) error {
+		n := &nodes[i]
+		for s := 0; s < steps; s++ {
+			c := &n.bag[n.rng.IntN(len(n.bag))]
+			if _, err := learnStep(cfg, n.w, g, n.opt, ws, c.text, tgtLo, tgtHi, lr); err != nil {
+				return fmt.Errorf("node %d: %w", n.id, err)
+			}
+		}
+		return nil
+	})
+}
+
+type pair struct {
+	a, b       int
+	ia, ib     int
+	ownA, ownB float64
+	crossA     float64
+	crossB     float64
+	swap       bool
+}
+
+func planMatch(nodes []node, rng *rand.Rand) []pair {
+	order := make([]int, len(nodes))
+	for i := range order {
+		order[i] = i
+	}
+	rng.Shuffle(len(order), func(i, j int) { order[i], order[j] = order[j], order[i] })
+	var pairs []pair
+	for i := 0; i+1 < len(order); i += 2 {
+		a, b := order[i], order[i+1]
+		ia, ib := worstIndex(&nodes[a]), worstIndex(&nodes[b])
+		pairs = append(pairs, pair{
+			a: a, b: b, ia: ia, ib: ib,
+			ownA: nodes[a].bag[ia].hold,
+			ownB: nodes[b].bag[ib].hold,
+		})
+	}
+	return pairs
+}
+
+// gainsSwap is true when exchanging the two windows lowers the sum of their
+// held-out losses.
+func gainsSwap(ownA, crossA, ownB, crossB float64) bool {
+	return crossA+crossB < ownA+ownB
+}
+
+func matchAll(nodes []node, cfg Config, rng *rand.Rand, adopt, trainLo, trainHi, holdLo, holdHi int, lr float32, workers int) (int, int, error) {
+	pairs := planMatch(nodes, rng)
+	if err := parallel(len(pairs), workers, cfg, false, func(i int, ws *workspace, _ *tensors) error {
+		p := &pairs[i]
+		wa := nodes[p.a].bag[p.ia].text
+		wb := nodes[p.b].bag[p.ib].text
+		ca, _, err := finiteLoss(cfg, nodes[p.a].w, ws, wb, holdLo, holdHi)
+		if err != nil {
+			return err
+		}
+		cb, _, err := finiteLoss(cfg, nodes[p.b].w, ws, wa, holdLo, holdHi)
+		if err != nil {
+			return err
+		}
+		p.crossA = ca
+		p.crossB = cb
+		p.swap = gainsSwap(p.ownA, ca, p.ownB, cb)
+		return nil
+	}); err != nil {
+		return 0, 0, err
+	}
+	swaps := 0
+	swapped := make([]bool, len(nodes))
+	for i := range pairs {
+		p := &pairs[i]
+		if !p.swap {
+			continue
+		}
+		a, b := &nodes[p.a], &nodes[p.b]
+		a.bag[p.ia], b.bag[p.ib] = b.bag[p.ib], a.bag[p.ia]
+		a.trades++
+		b.trades++
+		swapped[p.a] = true
+		swapped[p.b] = true
+		swaps++
+	}
+	if adopt > 0 && swaps > 0 {
+		if err := parallel(len(nodes), workers, cfg, true, func(i int, ws *workspace, g *tensors) error {
+			if !swapped[i] {
+				return nil
+			}
+			n := &nodes[i]
+			// The received window is the one just written into the bag slot
+			// that this node offered. Both endpoints of a pair were flagged.
+			var text []byte
+			for _, p := range pairs {
+				if !p.swap {
+					continue
+				}
+				if p.a == i {
+					text = n.bag[p.ia].text
+					break
+				}
+				if p.b == i {
+					text = n.bag[p.ib].text
+					break
+				}
+			}
+			for s := 0; s < adopt; s++ {
+				if _, err := learnStep(cfg, n.w, g, n.opt, ws, text, trainLo, trainHi, lr); err != nil {
+					return fmt.Errorf("node %d: %w", n.id, err)
+				}
+			}
+			return scoreNode(n, cfg, ws, holdLo, holdHi)
+		}); err != nil {
+			return swaps, len(pairs), err
+		}
+	} else if swaps > 0 {
+		if err := parallel(len(nodes), workers, cfg, false, func(i int, ws *workspace, _ *tensors) error {
+			if !swapped[i] {
+				return nil
+			}
+			return scoreNode(&nodes[i], cfg, ws, holdLo, holdHi)
+		}); err != nil {
+			return swaps, len(pairs), err
+		}
+	}
+	return swaps, len(pairs), nil
+}
+
+// exchange is the single-pair form of a match, used by tests.
+func exchange(a, b *node, cfg Config, ws *workspace, g *tensors, adopt, trainLo, trainHi, holdLo, holdHi int, lr float32) (bool, error) {
+	ia, ib := worstIndex(a), worstIndex(b)
+	ownA, ownB := a.bag[ia].hold, b.bag[ib].hold
+	crossA, _, err := finiteLoss(cfg, a.w, ws, b.bag[ib].text, holdLo, holdHi)
+	if err != nil {
+		return false, err
+	}
+	crossB, _, err := finiteLoss(cfg, b.w, ws, a.bag[ia].text, holdLo, holdHi)
+	if err != nil {
+		return false, err
+	}
+	if !gainsSwap(ownA, crossA, ownB, crossB) {
+		return false, nil
+	}
+	a.bag[ia], b.bag[ib] = b.bag[ib], a.bag[ia]
+	for s := 0; s < adopt; s++ {
+		if _, err = learnStep(cfg, a.w, g, a.opt, ws, a.bag[ia].text, trainLo, trainHi, lr); err != nil {
+			return false, err
+		}
+		if _, err = learnStep(cfg, b.w, g, b.opt, ws, b.bag[ib].text, trainLo, trainHi, lr); err != nil {
+			return false, err
+		}
+	}
+	if err = scoreNode(a, cfg, ws, holdLo, holdHi); err != nil {
+		return false, err
+	}
+	if err = scoreNode(b, cfg, ws, holdLo, holdHi); err != nil {
+		return false, err
+	}
+	a.trades++
+	b.trades++
+	return true, nil
+}
+
+func lossStats(nodes []node) (mean, min, max, base, acc float64) {
+	min = math.Inf(1)
+	for i := range nodes {
+		mean += nodes[i].own
+		base += nodes[i].base
+		acc += nodes[i].acc
+		if nodes[i].own < min {
+			min = nodes[i].own
+		}
+		if nodes[i].own > max {
+			max = nodes[i].own
 		}
 	}
 	n := float64(len(nodes))
-	return initMean / n, trainMean / n, trainMin, trainMax, trainAcc / n
+	return mean / n, min, max, base / n, acc / n
 }
 
-func currentLoss(nodes []node) (mean, min, max float64) {
-	min = math.Inf(1)
+func currentStats(nodes []node) (mean, min, max, acc float64) {
+	mean, min, max, _, acc = lossStats(nodes)
+	return mean, min, max, acc
+}
+
+func checkChunks(nodes []node) (int, error) {
+	seen := make(map[int]int)
+	n := 0
 	for i := range nodes {
-		v := nodes[i].own
-		mean += v
-		if v < min {
-			min = v
+		if len(nodes[i].bag) < 2 {
+			return 0, fmt.Errorf("verification failed: node %d holds %d windows", i, len(nodes[i].bag))
 		}
-		if v > max {
-			max = v
+		for _, c := range nodes[i].bag {
+			if len(c.text) == 0 {
+				return 0, fmt.Errorf("verification failed: empty window %d", c.id)
+			}
+			seen[c.id]++
+			n++
 		}
 	}
-	mean /= float64(len(nodes))
-	return mean, min, max
+	if len(seen) != n {
+		return 0, fmt.Errorf("verification failed: %d windows but %d distinct ids", n, len(seen))
+	}
+	for id := 0; id < n; id++ {
+		if seen[id] != 1 {
+			return 0, fmt.Errorf("verification failed: window %d is held by %d nodes", id, seen[id])
+		}
+	}
+	return n, nil
 }
 
-func checkPermutation(nodes []node) error {
-	seen := make([]int, len(nodes))
-	for i := range nodes {
-		s := nodes[i].src
-		if s < 0 || s >= len(nodes) || len(nodes[i].text) != len(nodes[0].text) {
-			return fmt.Errorf("verification failed: node %d holds an invalid window", i)
-		}
-		seen[s]++
-	}
-	for s, c := range seen {
-		if c != 1 {
-			return fmt.Errorf("verification failed: window %d is held by %d nodes", s, c)
-		}
-	}
-	return nil
-}
-
-func printSamples(nodes []node, starts []int) {
+func printSamples(nodes []node) {
 	idxs := []int{0, len(nodes) / 4, len(nodes) / 2, 3 * len(nodes) / 4}
-	if len(nodes) == 1 {
-		idxs = []int{0}
-	}
 	seen := map[int]bool{}
-	fmt.Printf("%-6s %-6s %-8s %-8s %s\n", "node", "src", "offset", "loss", "text")
+	say("%-6s %-6s %-8s %-8s %s\n", "node", "bag", "trades", "loss", "origin / text")
 	for _, id := range idxs {
 		if id < 0 || id >= len(nodes) || seen[id] {
 			continue
 		}
 		seen[id] = true
 		n := &nodes[id]
-		fmt.Printf("%-6d %-6d %-8d %-8.3f %s\n", n.id, n.src, starts[n.src], n.own, preview(n.text))
+		say("%-6d %-6d %-8d %-8.3f %s | %s\n",
+			n.id, len(n.bag), n.trades, n.own, shortName(n.origin), preview(n.bag[0].text))
 	}
 	best := 0
 	for i := range nodes {
@@ -415,9 +784,17 @@ func printSamples(nodes []node, starts []int) {
 	}
 	if nodes[best].trades > 0 {
 		n := &nodes[best]
-		fmt.Printf("most trades node %d count=%d src=%d loss=%.3f %s\n",
-			n.id, n.trades, n.src, n.own, preview(n.text))
+		say("most trades node %d count=%d loss=%.3f %s | %s\n",
+			n.id, n.trades, n.own, shortName(n.origin), preview(n.bag[0].text))
 	}
+}
+
+func shortName(s string) string {
+	const n = 32
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
 }
 
 func preview(b []byte) string {
@@ -434,33 +811,4 @@ func preview(b []byte) string {
 		buf[i] = c
 	}
 	return string(buf)
-}
-
-// windowStarts picks nodes non-overlapping windows of context bytes, spread
-// across a file of n bytes. Window i begins at a multiple of context.
-func windowStarts(n, context, nodes int) ([]int, error) {
-	if context < 2 {
-		return nil, fmt.Errorf("context %d is below 2", context)
-	}
-	if nodes < 1 {
-		return nil, fmt.Errorf("nodes %d is below 1", nodes)
-	}
-	usable := n / context
-	if nodes > usable {
-		return nil, fmt.Errorf("file has %d non-overlapping windows of %d bytes, need %d", usable, context, nodes)
-	}
-	starts := make([]int, nodes)
-	prev := -1
-	for i := 0; i < nodes; i++ {
-		off := i * usable / nodes
-		if off <= prev {
-			off = prev + 1
-		}
-		if off >= usable {
-			return nil, fmt.Errorf("window %d does not fit", i)
-		}
-		starts[i] = off * context
-		prev = off
-	}
-	return starts, nil
 }
